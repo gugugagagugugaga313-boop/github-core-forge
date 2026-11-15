@@ -31,6 +31,8 @@ export interface RestResult {
   headers?: Record<string, string>;
   /** Pre-serialized JSON payload; when present it is sent verbatim. */
   raw?: string;
+  /** Pre-serialized JSON payload bytes; when present they are sent verbatim. */
+  rawBytes?: Buffer;
 }
 
 function fail(status: number, message: string): never {
@@ -337,6 +339,7 @@ function handleRepo(ctx: RestContext, owner: string, name: string): RestResult {
     if (defaultBranch !== undefined) {
       if (!repo.refs.has(`refs/heads/${defaultBranch}`)) fail(422, 'default branch does not exist');
       repo.defaultBranch = defaultBranch;
+      ctx.forge.bumpGit(repo);
     }
     const newName = reqString(body, 'name');
     if (newName !== undefined && newName !== name) {
@@ -419,6 +422,7 @@ function handleGitRefs(ctx: RestContext, repo: Repo, rest: string[]): RestResult
       if (!repo.objects.has(sha)) fail(422, 'sha does not exist');
       if (repo.refs.has(ref)) fail(422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      ctx.forge.bumpGit(repo);
       return { status: 201, body: { ref, object: { sha, type: repo.objects.get(sha)!.type } } };
     }
     fail(405, 'Method Not Allowed');
@@ -432,6 +436,7 @@ function handleGitRefs(ctx: RestContext, repo: Repo, rest: string[]): RestResult
   if (ctx.method === 'DELETE') {
     if (!repo.refs.has(ref)) fail(404, 'Reference does not exist');
     repo.refs.delete(ref);
+    ctx.forge.bumpGit(repo);
     return { status: 204, body: null };
   }
   if (ctx.method === 'PATCH') {
@@ -440,6 +445,7 @@ function handleGitRefs(ctx: RestContext, repo: Repo, rest: string[]): RestResult
     if (!sha || !repo.objects.has(sha)) fail(422, 'sha does not exist');
     if (!repo.refs.has(ref)) fail(404, 'Reference does not exist');
     repo.refs.set(ref, sha);
+    ctx.forge.bumpGit(repo);
     return { status: 200, body: { ref, object: { sha, type: repo.objects.get(sha)!.type } } };
   }
   fail(405, 'Method Not Allowed');
@@ -645,10 +651,10 @@ function handleIssues(ctx: RestContext, repo: Repo, rest: string[]): RestResult 
   if (rest.length > 1) fail(404, 'Not Found');
   if (ctx.method === 'GET') {
     if (issue) {
-      if (issue.cachedJson) return { status: 200, body: null, raw: issue.cachedJson };
-      const json = JSON.stringify(issueView(forge, repo, issue));
-      issue.cachedJson = json;
-      return { status: 200, body: null, raw: json };
+      if (issue.cachedBytes) return { status: 200, body: null, rawBytes: issue.cachedBytes };
+      const bytes = Buffer.from(JSON.stringify(issueView(forge, repo, issue)), 'utf8');
+      issue.cachedBytes = bytes;
+      return { status: 200, body: null, rawBytes: bytes };
     }
     if (pull) return { status: 200, body: pullAsIssueView(forge, repo, pull) };
     fail(404, 'Not Found');
@@ -678,7 +684,7 @@ function handleIssues(ctx: RestContext, repo: Repo, rest: string[]): RestResult 
       }
       issue.updatedAt = forge.nowIso;
       issue.cachedView = null;
-      issue.cachedJson = null;
+      issue.cachedBytes = null;
       return { status: 200, body: issueView(forge, repo, issue) };
     }
     if (pull) {

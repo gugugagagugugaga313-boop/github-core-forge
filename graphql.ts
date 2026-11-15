@@ -593,7 +593,7 @@ class Executor {
       issue.closedAt = this.forge.nowIso;
       issue.updatedAt = this.forge.nowIso;
       issue.cachedView = null;
-      issue.cachedJson = null;
+      issue.cachedBytes = null;
       return { __type: 'CloseIssuePayload', issue: this.issueObject(repo, issue), clientMutationId };
     }
     if (name === 'createPullRequest') {

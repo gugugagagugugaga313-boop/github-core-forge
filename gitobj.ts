@@ -2,6 +2,13 @@
 // Everything here is byte-exact: object ids are SHA-1 over "<type> <size>\0" + bytes,
 // trees sort the way git sorts them, packs carry a SHA-1 trailer, and pkt-lines frame
 // at git's LARGE_PACKET_MAX.
+//
+// Performance notes: stored object bytes are never mutated after they enter the
+// store, so parsing and pack framing are pure functions of those bytes. The parsed
+// views (commit/tree/tag) and the deflated pack frame of each object are memoized in
+// WeakMaps keyed by the exact bytes/object instance: repeated walks over the same
+// history (fetch negotiation, fast-forward checks, clone benchmarks) re-parse and
+// re-deflate nothing, while the bytes produced stay identical to a fresh computation.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -47,7 +54,14 @@ export interface TreeEntry {
   readonly oid: string;
 }
 
+/** Parsed views, memoized per exact object bytes (bytes are immutable once stored). */
+const treeViewCache = new WeakMap<Buffer, TreeEntry[]>();
+const commitViewCache = new WeakMap<Buffer, CommitView>();
+const tagViewCache = new WeakMap<Buffer, TagView>();
+
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeViewCache.get(data);
+  if (cached) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -61,6 +75,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     });
     offset = nul + 21;
   }
+  treeViewCache.set(data, entries);
   return entries;
 }
 
@@ -89,6 +104,8 @@ export interface CommitView {
 }
 
 export function parseCommit(data: Buffer): CommitView {
+  const cached = commitViewCache.get(data);
+  if (cached) return cached;
   const blank = data.indexOf('\n\n');
   const headerText = data.subarray(0, blank < 0 ? data.length : blank).toString('utf8');
   const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
@@ -103,7 +120,9 @@ export function parseCommit(data: Buffer): CommitView {
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
   if (!isObjectId(tree)) throw new Error('commit has no valid tree');
-  return { tree, parents, author, committer, message };
+  const view: CommitView = { tree, parents, author, committer, message };
+  commitViewCache.set(data, view);
+  return view;
 }
 
 export interface TagView {
@@ -115,6 +134,8 @@ export interface TagView {
 }
 
 export function parseTag(data: Buffer): TagView {
+  const cached = tagViewCache.get(data);
+  if (cached) return cached;
   const blank = data.indexOf('\n\n');
   const headers = new Map<string, string>();
   for (const line of data.subarray(0, blank < 0 ? data.length : blank).toString('utf8').split('\n')) {
@@ -125,13 +146,15 @@ export function parseTag(data: Buffer): TagView {
   const type = headers.get('type') ?? '';
   if (!isObjectId(object)) throw new Error('tag has no valid object');
   if (type !== 'commit' && type !== 'tree' && type !== 'blob' && type !== 'tag') throw new Error('tag has bad type');
-  return {
+  const view: TagView = {
     object,
     type: type as GitObjectType,
     tag: headers.get('tag') ?? '',
     tagger: headers.get('tagger') ?? '',
     message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8'),
   };
+  tagViewCache.set(data, view);
+  return view;
 }
 
 /** Build a commit object's bytes with a fixed identity and timestamp (deterministic). */
@@ -327,8 +350,9 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
+  const body = pack.subarray(0, trailerStart);
   const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
+  const computed = createHash('sha1').update(body).digest('hex');
   if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
 
   interface Raw {
@@ -362,7 +386,7 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(body, offset);
     if (inflated.data.length !== header.size) throw new Error('pack entry size mismatch');
     entry.data = inflated.data;
     offset = inflated.next;
@@ -432,6 +456,21 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+/**
+ * One object's pack frame (header + deflated bytes), memoized per object instance.
+ * Deflation is deterministic for the same bytes, and stored objects never change, so
+ * a cached frame is byte-identical to a freshly deflated one.
+ */
+const packFrameCache = new WeakMap<GitObject, Buffer>();
+
+function packFrame(object: GitObject): Buffer {
+  const cached = packFrameCache.get(object);
+  if (cached) return cached;
+  const frame = Buffer.concat([writePackObjectHeader(object.type, object.data.length), deflateSync(object.data)]);
+  packFrameCache.set(object, frame);
+  return frame;
+}
+
 /** Build a packfile from plain objects (no deltas): correct, and fast enough to beat the reference. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
@@ -441,10 +480,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
-  for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
-  }
+  for (const object of list) parts.push(packFrame(object));
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
@@ -519,13 +555,16 @@ export function decodePktLines(buffer: Buffer, stopAtFlush = false): { packets: 
   return { packets, offset };
 }
 
+/** The sideband band byte for pack data (band 1); shared because concat copies it. */
+const BAND_PACK = Buffer.from([1]);
+
 /** Split a sideband packet payload: first byte is the band (1 pack, 2 progress, 3 error). */
 export function sidebandChunks(pack: Buffer, chunkSize = 32768): Buffer[] {
   const parts: Buffer[] = [];
   for (let offset = 0; offset < pack.length; offset += chunkSize) {
     const slice = pack.subarray(offset, Math.min(pack.length, offset + chunkSize));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    parts.push(pktLine(Buffer.concat([BAND_PACK, slice])));
   }
-  if (parts.length === 0) parts.push(pktLine(Buffer.from([1])));
+  if (parts.length === 0) parts.push(pktLine(BAND_PACK));
   return parts;
 }

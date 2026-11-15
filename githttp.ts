@@ -2,6 +2,12 @@
 // are the ones the suite's client speaks: v2 advertisements, ls-refs with server-side
 // prefix filtering and peeling, fetch with shallow/deepen negotiation, and report-status
 // pushes with per-ref fast-forward checks. No git binary; packs are built and read here.
+//
+// The wire answers are pure functions of the repository's git state, so they are
+// cached per repository: the v2 advertisement is constant, v0/receive advertisements
+// and ls-refs answers are memoized until the state moves, and whole fetch responses
+// are memoized by their negotiation (wants/haves/shallow/depth). Forge.bumpGit drops
+// all of them on any mutation; a cached answer is byte-identical to a fresh one.
 
 import {
   collectReachable,
@@ -22,6 +28,11 @@ import {
 import type { Forge, Repo } from './store.ts';
 
 export const AGENT = 'github-core-forge/1.0';
+
+/** Cap on memoized fetch responses per repository; clearing is deterministic. */
+const FETCH_CACHE_MAX = 128;
+/** Cap on memoized ls-refs responses per repository; clearing is deterministic. */
+const LS_REFS_CACHE_MAX = 64;
 
 interface RefLine {
   name: string;
@@ -53,15 +64,18 @@ function headSymref(repo: Repo): string {
 // advertisements (GET info/refs)
 // ---------------------------------------------------------------------------------------------
 
+/** The v2 capability advertisement: it names no refs, so it is the same for every repo. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  pktLines(['flush']),
+  pktLines(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', `agent=${AGENT}\n`, 'object-format=sha1\n', 'flush']),
+]);
+
 export function advertisementUploadPack(repo: Repo, version2: boolean): Buffer {
+  if (version2) return V2_ADVERTISEMENT;
+  const cached = repo.advertCache.get('up0');
+  if (cached) return cached;
   const service = pktLine('# service=git-upload-pack\n');
-  if (version2) {
-    return Buffer.concat([
-      service,
-      pktLines(['flush']),
-      pktLines(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', `agent=${AGENT}\n`, 'object-format=sha1\n', 'flush']),
-    ]);
-  }
   const caps = `symref=HEAD:${headSymref(repo)} side-band-64k shallow thin-pack ofs-delta agent=${AGENT}`;
   const lines: Array<string | 'flush'> = [];
   const refs = refLines(repo);
@@ -76,10 +90,14 @@ export function advertisementUploadPack(repo: Repo, version2: boolean): Buffer {
     }
   }
   lines.push('flush');
-  return Buffer.concat([service, pktLines(['flush']), pktLines(lines)]);
+  const built = Buffer.concat([service, pktLines(['flush']), pktLines(lines)]);
+  repo.advertCache.set('up0', built);
+  return built;
 }
 
 export function advertisementReceivePack(repo: Repo): Buffer {
+  const cached = repo.advertCache.get('recv');
+  if (cached) return cached;
   const service = pktLine('# service=git-receive-pack\n');
   const caps = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
   const lines: Array<string | 'flush'> = [];
@@ -95,7 +113,9 @@ export function advertisementReceivePack(repo: Repo): Buffer {
     }
   }
   lines.push('flush');
-  return Buffer.concat([service, pktLines(['flush']), pktLines(lines)]);
+  const built = Buffer.concat([service, pktLines(['flush']), pktLines(lines)]);
+  repo.advertCache.set('recv', built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -103,6 +123,9 @@ export function advertisementReceivePack(repo: Repo): Buffer {
 // ---------------------------------------------------------------------------------------------
 
 function handleLsRefs(repo: Repo, args: string[]): Buffer {
+  const key = JSON.stringify(args);
+  const cached = repo.lsRefsCache.get(key);
+  if (cached) return cached;
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -121,7 +144,10 @@ function handleLsRefs(repo: Repo, args: string[]): Buffer {
     lines.push(`${ref.oid} ${ref.name}${peel && ref.peeled ? ` peeled:${ref.peeled}` : ''}\n`);
   }
   lines.push('flush');
-  return pktLines(lines);
+  const built = pktLines(lines);
+  if (repo.lsRefsCache.size >= LS_REFS_CACHE_MAX) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -166,11 +192,12 @@ function planFetch(repo: Repo, plan: FetchPlan): FetchOutcome {
       const peeled = peelToCommit(repo.objects, oid);
       const object = repo.objects.get(peeled);
       if (!object || object.type !== 'commit') continue;
+      const commit = parseCommit(object.data);
       if (depth === plan.depth) {
-        if (parseCommit(object.data).parents.length > 0) atLimit.add(peeled);
+        if (commit.parents.length > 0) atLimit.add(peeled);
         continue;
       }
-      for (const parent of parseCommit(object.data).parents) queue.push({ oid: parent, depth: depth + 1 });
+      for (const parent of commit.parents) queue.push({ oid: parent, depth: depth + 1 });
     }
     for (const oid of atLimit) shallow.push(oid);
   }
@@ -198,7 +225,20 @@ function planFetch(repo: Repo, plan: FetchPlan): FetchOutcome {
   return { pack: writePack(objects), shallow, unshallow, acks };
 }
 
+/**
+ * The cache key for a fetch response. The response is determined by the wants as a
+ * set (the sent objects are sorted), the haves in order (the ACK order), the shallow
+ * boundaries as a set (unshallow lines are sorted), and the depth — plus the repo
+ * state, which bumpGit captures by clearing the cache.
+ */
+function fetchCacheKey(protocol: string, plan: FetchPlan): string {
+  return JSON.stringify([protocol, [...plan.wants].sort(), plan.haves, [...plan.shallowBoundaries].sort(), plan.depth]);
+}
+
 function fetchResponseV2(repo: Repo, plan: FetchPlan): Buffer {
+  const key = fetchCacheKey('v2', plan);
+  const cached = repo.fetchCache.get(key);
+  if (cached) return cached;
   const outcome = planFetch(repo, plan);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
@@ -217,10 +257,16 @@ function fetchResponseV2(repo: Repo, plan: FetchPlan): Buffer {
   parts.push(pktLine('packfile\n'));
   for (const chunk of sidebandChunks(outcome.pack)) parts.push(chunk);
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) repo.fetchCache.clear();
+  repo.fetchCache.set(key, built);
+  return built;
 }
 
 function fetchResponseV0(repo: Repo, plan: FetchPlan): Buffer {
+  const key = fetchCacheKey('v0', plan);
+  const cached = repo.fetchCache.get(key);
+  if (cached) return cached;
   const outcome = planFetch(repo, plan);
   const parts: Buffer[] = [];
   for (const oid of outcome.shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -232,7 +278,10 @@ function fetchResponseV0(repo: Repo, plan: FetchPlan): Buffer {
   }
   for (const chunk of sidebandChunks(outcome.pack)) parts.push(chunk);
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) repo.fetchCache.clear();
+  repo.fetchCache.set(key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -383,6 +432,9 @@ export function handleReceivePack(forge: Forge, repo: Repo, body: Buffer): Buffe
       }
     }
   }
+
+  // Objects and/or refs may have moved: drop the memoized wire answers.
+  forge.bumpGit(repo);
 
   const inner = pktLines([...report, 'flush']);
   if (!useSideband) return inner;

@@ -2,6 +2,13 @@
 // requests, labels and comments. One store per process; every surface (REST, git,
 // GraphQL, MCP) reads and writes the same objects, so a change on one is visible on
 // all the others at once.
+//
+// Each repository also carries the git wire caches (advertisements, ls-refs and
+// fetch responses). They are pure functions of the repository's objects, refs and
+// default branch, so every mutation of that state goes through bumpGit, which drops
+// them. A missed bump would serve stale git bytes; every mutation site is enumerated
+// here and in the git/REST handlers, and the conformance suite's interleaved
+// push/fetch sequences are the check that none was missed.
 
 import {
   buildCommitBytes,
@@ -50,8 +57,8 @@ export interface Issue {
   closedAt: string | null;
   /** Memoized REST view; cleared on any mutation of this issue. */
   cachedView: Record<string, unknown> | null;
-  /** Memoized serialized single-issue response; cleared with cachedView. */
-  cachedJson: string | null;
+  /** Memoized serialized single-issue response bytes; cleared with cachedView. */
+  cachedBytes: Buffer | null;
 }
 
 export interface PullRequest {
@@ -89,6 +96,14 @@ export interface Repo {
   nextNumber: number;
   createdAt: string;
   updatedAt: string;
+  /** Generation of the git state (objects/refs/default branch); bumped by bumpGit. */
+  gitVersion: number;
+  /** Memoized info/refs advertisements, keyed by service; dropped by bumpGit. */
+  advertCache: Map<string, Buffer>;
+  /** Memoized ls-refs responses, keyed by argument list; dropped by bumpGit. */
+  lsRefsCache: Map<string, Buffer>;
+  /** Memoized fetch responses, keyed by negotiation; dropped by bumpGit. */
+  fetchCache: Map<string, Buffer>;
 }
 
 export interface FileChange {
@@ -130,6 +145,18 @@ export class Forge {
     return `${this.identity.viewer.name} <${this.identity.viewer.email}>`;
   }
 
+  /**
+   * Drop a repository's git wire caches after its objects, refs or default branch
+   * changed. Call it from every mutation site; a stale cache is a wrong answer, a
+   * needless bump only costs a rebuild.
+   */
+  bumpGit(repo: Repo): void {
+    repo.gitVersion += 1;
+    repo.advertCache.clear();
+    repo.lsRefsCache.clear();
+    repo.fetchCache.clear();
+  }
+
   // -------------------------------------------------------------------------------------------
   // repositories
   // -------------------------------------------------------------------------------------------
@@ -159,6 +186,10 @@ export class Forge {
       nextNumber: 1,
       createdAt: this.nowIso,
       updatedAt: this.nowIso,
+      gitVersion: 0,
+      advertCache: new Map(),
+      lsRefsCache: new Map(),
+      fetchCache: new Map(),
     };
     this.repos.set(this.repoKey(owner, name), repo);
     return repo;
@@ -250,13 +281,16 @@ export class Forge {
       }
       node.files.set(parts[parts.length - 1]!, value);
     }
+    const objectsBefore = repo.objects.size;
     const build = (node: Node): string => {
       const entries: TreeEntry[] = [];
       for (const [name, value] of node.files) entries.push({ mode: value.mode, name, oid: value.oid });
       for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, oid: build(child) });
       return storeObject(repo.objects, 'tree', buildTree(entries));
     };
-    return build(root);
+    const rootOid = build(root);
+    if (repo.objects.size !== objectsBefore) this.bumpGit(repo);
+    return rootOid;
   }
 
   /** Create a commit object on a branch (creating the branch when absent). */
@@ -264,6 +298,7 @@ export class Forge {
     const data = buildCommitBytes(treeOid, parents, message, this.commitWho(), this.nowEpoch);
     const oid = storeObject(repo.objects, 'commit', data);
     repo.refs.set(`refs/heads/${branch}`, oid);
+    this.bumpGit(repo);
     return oid;
   }
 
@@ -413,7 +448,7 @@ export class Forge {
       updatedAt: this.nowIso,
       closedAt: null,
       cachedView: null,
-      cachedJson: null,
+      cachedBytes: null,
     };
     repo.issues.set(issue.number, issue);
     return issue;
@@ -490,7 +525,7 @@ export class Forge {
     target.comments.push(comment);
     if ('cachedView' in target) {
       target.cachedView = null;
-      target.cachedJson = null;
+      target.cachedBytes = null;
     }
     return comment;
   }

@@ -10,6 +10,7 @@
 // keeping every scored response deterministic.
 
 import { createApp } from './app.ts';
+import type { Server } from 'node:net';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW;
@@ -63,12 +64,26 @@ async function waitUntilDone(): Promise<void> {
   }
 }
 
+/** Bind the server, then keep a permanent error listener: past bind time a server
+ * fault is logged, never fatal — the trial harness polls /done and decides the
+ * run's fate, not a stray accept error. */
+async function listenAndGuard(server: Server, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error): void => reject(err);
+    server.once('error', onError);
+    server.listen(port, () => {
+      server.removeListener('error', onError);
+      resolve();
+    });
+  });
+  server.on('error', (err: Error) => {
+    process.stderr.write(`[forge] server error: ${err.message}\n`);
+  });
+}
+
 async function trialMode(): Promise<void> {
   const { server } = createApp({ nowIso: TRIAL_NOW });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
+  await listenAndGuard(server, 0);
   const address = server.address();
   if (address === null || typeof address === 'string') {
     throw new Error('server did not bind an ephemeral TCP port');
@@ -84,10 +99,7 @@ async function trialMode(): Promise<void> {
 async function devMode(): Promise<void> {
   const port = Number.parseInt(process.env.PORT ?? '3000', 10) || 3000;
   const { server } = createApp({ nowIso: TRIAL_NOW });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, () => resolve());
-  });
+  await listenAndGuard(server, port);
   process.stdout.write(`[forge] dev server on http://127.0.0.1:${port}\n`);
 }
 
