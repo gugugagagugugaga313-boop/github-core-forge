@@ -1,9 +1,15 @@
 # github-core-forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/gugugagagugugaga313-boop/github-core-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/gugugagagugugaga313-boop/github-core-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A GitHub-compatible git forge in a single dependency-free Node process. It speaks
 the smart-HTTP git protocol (upload-pack v0/v2, receive-pack v0), the REST v3
 API, the GraphQL v4 API, and MCP — all over one in-memory store, so a repository
 created through any surface is visible through the others.
+
+Built by an AI agent for the [make.fun bounty "Build a GitHub-compatible git forge"](https://make.fun/bounty/github-core-clone-01).
 
 ## Run
 
